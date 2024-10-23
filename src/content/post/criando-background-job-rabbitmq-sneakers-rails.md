@@ -31,7 +31,7 @@ Para configuração e execução do projeto será necessário atender aos seguin
 
 1. Ter o docker instalado;
 2. Ter Rails na versão ≥ 6;
-3. Ter o ruby na versão ≥ 2
+3. Ter o ruby na versão ≥ 3
 4. Sneakers na versão ≥ 2.11.0
 
 ## Instalação do RabbitMQ
@@ -46,16 +46,16 @@ version: '3.7'
 
 services:
   rabbitmq:
-      container_name: rabbitmq-worker
-      image: rabbitmq:management-alpine
-      ports:
-        - 5672:5672
-        - 15672:15672
-      volumes:
-        - rabbitmq-data:/var/lib/rabbitmq
-      environment:
-        RABBITMQ_DEFAULT_USER: rabbitmq
-        RABBITMQ_DEFAULT_PASS: rabbitmq
+    container_name: rabbitmq-worker
+    image: rabbitmq:management-alpine
+    ports:
+      - 5672:5672
+      - 15672:15672
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: rabbitmq
+      RABBITMQ_DEFAULT_PASS: rabbitmq
 volumes:
   rabbitmq-data:
 ```
@@ -99,6 +99,115 @@ Também é possível realizar o procedimento mostrado acima com a execução do 
 `docker-compose run rabbitmq bash` no seu terminal
 :::
 
+então execute o comando:
+
+```bash
+rabbitmq-plugins enable rabbitmq_management
+```
+<br /><br />
+
+veja como fica na imagem abaixo:
+
+![Extensão para docker](@/assets/rabbit-shell2.webp)
+[ampliar imagem](https://postimg.cc/0r8Dx88L)
+<br /><br />
+
+execute:
+
+```bash
+docker-compose up -d
+```
+
+Pronto com o rabbitmq_management habilitado é possível acessar
+`http://localhost:15672` usando o login e a senha `rabbitmq`
+
+
+
+## Implementação da aplicação BackgroundJob
+
+Dependências:
+
+`Ruby 3.3.0`
+
+`Rails 6.1.7.9`
+
+Entre na pasta rabbitmq-work e rode:
+
+```bash
+rails new background-job
+```
+
+após a aplicação ser criada com sucesso adicione o `sneakers` ao gemfile do rails
+
+```bash
+bundle add sneakers
+```
+depois dentro da pasta da aplicação crie o arquivo `/config/initializers/sneakers.rb` com o seguinte conteúdo:
+
+```ruby
+# frozen_string_literal: true
+
+require 'sneakers/metrics/logging_metrics'
+
+Sneakers.configure(
+  amqp:      'amqp://rabbitmq:rabbitmq@localhost:5672', # Connection with RabbitMQ
+  metrics:   Sneakers::Metrics::LoggingMetrics.new,     # A metrics provider implementation
+  workers:   4,                                         # Number of per-cpu processes to run
+  threads:   5,                                         # Threadpool size (good to match prefetch)
+  prefetch:  5,                                         # Grab 5 jobs together. Better speed.
+  durable:   true,                                      # Is queue durable?
+  ack:       true,                                      # Must we acknowledge?
+  heartbeat: 2,                                         # Keep a good connection with broker
+  env:       'development')                             # Environment
+
+Sneakers.logger = Rails.logger
+Sneakers.logger.level = Logger::INFO
+```
+Aqui está uma explicação detalhada sobre essas configurações:
+
+```ruby
+require 'sneakers/metrics/logging_metrics'
+```
+Esta linha importa a classe LoggingMetrics do módulo Sneakers::Metrics, que será usada para registrar
+métricas.
+
+```ruby
+Sneakers.configure(
+  amqp:      'amqp://rabbitmq:rabbitmq@localhost:5672', # Connection with RabbitMQ
+  metrics:   Sneakers::Metrics::LoggingMetrics.new,     # A metrics provider implementation
+  workers:   4,                                         # Number of per-cpu processes to run
+  threads:   5,                                         # Threadpool size (good to match prefetch)
+  prefetch:  5,                                         # Grab 5 jobs together. Better speed.
+  durable:   true,                                      # Is queue durable?
+  ack:       true,                                      # Must we acknowledge?
+  heartbeat: 2,                                         # Keep a good connection with broker
+  env:       'development')
+```
+
+:::note
+Essas configurações podem ser complementadas ou sobrescritas dentro de cada classe de work.
+:::
+
+Esta configuração define vários parâmetros para o funcionamento do Sneakers:
+
+* amqp: URL de conexão com o RabbitMQ.
+* metrics: Instância de LoggingMetrics para registrar métricas.
+* workers: Número de processos por CPU.
+* threads: Tamanho do pool de threads.
+* prefetch: Número de jobs que serão pré-carregados.
+* durable: Define se a fila é durável.
+* ack: Define se é necessário reconhecimento (acknowledgment).
+* heartbeat: Intervalo de heartbeat para manter a conexão com o broker.
+* env: Ambiente de execução (neste caso, 'development').
+
+```ruby
+Sneakers.logger = Rails.logger
+Sneakers.logger.level = Logger::INFO
+```
+Estas linhas configuram o logger do Sneakers para usar o logger do Rails e definem o nível de log para INFO.
+
+Este código é essencial para integrar o processamento de filas com RabbitMQ na aplicação, garantindo que as tarefas sejam gerenciadas de forma eficiente e que as métricas e logs sejam devidamente registrados.
+
 após isso crie a pasta `/app/workers` e crie o arquivo `/app/workers/profiling_worker.rb` com o código a
 seguir:
 
@@ -118,21 +227,66 @@ class ProfilingWorker
   end
 end
 ```
+O código acima define uma classe ProfilingWorker que utiliza a biblioteca Sneakers para processar mensagens de uma fila RabbitMQ.
+Este worker é configurado para processar mensagens da fila 'downloads', registrar o conteúdo da mensagem e reconhecer a mensagem como processada. Se ocorrer um erro durante o processamento, o erro será registrado.
 
-Depois adicione o código abaixo ao arquivo `/Rakefile`
+Aqui está uma explicação detalhada do código:
 
+```ruby
+class ProfilingWorker
+  include Sneakers::Worker
+```
+* A classe `ProfilingWorker` inclui o módulo `Sneakers::Worker`, o que a transforma em um worker que pode processar mensagens de uma fila RabbitMQ.
+
+```ruby
+from_queue 'downloads',
+             exchange: 'download_process',
+             timeout_job_after: 1
+```
+* O método `from_queue` configura o worker para consumir mensagens da fila chamada `downloads`.
+* exchange: `download_process` especifica o exchange RabbitMQ associado à fila.
+* timeout_job_after: 1 define um tempo limite de 1 segundo para o processamento de cada mensagem.
+
+```ruby
+ def work(message)
+    logger.info JSON.parse(message)
+    ack!
+  rescue StandardError => e
+    logger.error e
+  end
+```
+* O método `work` é chamado para processar cada mensagem recebida da fila.
+* `logger.info JSON.parse(message)` registra a mensagem recebida após convertê-la de JSON para um objeto Ruby.
+* `ack!` reconhece a mensagem, informando ao RabbitMQ que foi processada com sucesso.
+* O bloco `rescue` captura qualquer exceção (StandardError) que ocorra durante o processamento da mensagem.
+`logger.error` e registra o erro ocorrido.
+
+Depois adicione o código
 
 ```ruby
 require "sneakers/tasks"
 ```
 
+ao arquivo `/Rakefile`
+
+```ruby
+# Add your own tasks in files placed in lib/tasks ending in .rake,
+# for example lib/tasks/capistrano.rake, and they will automatically be available to Rake.
+
+require_relative "config/application"
+require "sneakers/tasks"
+
+Rails.application.load_tasks
+```
+
 :::note
 Esse código no `Rakefile` adiciona uma task ao rails que irá executar os jobs implementados com o `Sneakers`
+execute no terminal `rake -T` e procure por `rake sneakers:run # Start work (set $WORKERS=Klass1,Klass2)`
+para confirmar se a configuração funciona.
 :::
-<br /><br />
 
-![Extensão para docker](@/assets/rabbit-shell2.webp)
-[ampliar imagem](https://postimg.cc/0r8Dx88L)
+![Extensão para docker](@/assets/rabbit-shell3.webp)
+[ampliar imagem](https://postimg.cc/fST9vv2w)
 <br /><br />
 
 rode o comando:
@@ -146,8 +300,6 @@ No caso acima apenas o work `ProfilingWorker` será executado caso queira execut
 nome por virgula dessa forma `WORKERS=ProfilingWorker,OtherWork rake sneakers:run` ou caso queira executar
 todos os works execute `rake sneakers:run`
 :::
-
-## Implementação da aplicação BackgroundJob
 
 abra o admin do `RabbitMQ` e acesse a área onde fica as filas, procure a fila `downloads` e publique a
  mensagem abaixo:
@@ -167,10 +319,6 @@ Não é necessário criar a exchange e a fila no RabbitMQ pois quando o work é 
 essas configurações.
 :::
 <br />
-
-![Extensão para docker](@/assets/rabbit-shell3.webp)
-[ampliar imagem](https://postimg.cc/fST9vv2w)
-<br /><br />
 
 Ao executar a mensagem acima a saída no console da aplicação deverá ser como é mostrado na imagem abaixo.
 <br /><br />
